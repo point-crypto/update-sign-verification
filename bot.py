@@ -54,6 +54,18 @@ def preprocess(path):
     img = img[y:y+h, x:x+w]
     return cv2.resize(img, (300, 150))
 
+# ================= FEATURE HELPERS =================
+def stroke_density(img):
+    return np.sum(img < 128) / img.size
+
+def contour_count(img):
+    edges = cv2.Canny(img, 50, 150)
+    cnts, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return len(cnts)
+
+def similarity(a, b):
+    return max(0, 100 - abs(a - b) * 100)
+
 # ================= VISUALS =================
 def heatmap(ref, test):
     diff = cv2.absdiff(ref, test)
@@ -98,7 +110,6 @@ def generate_pdf(report, images):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
-
     pdf.cell(0, 10, "Signature Verification Report", ln=True)
     pdf.ln(5)
 
@@ -119,11 +130,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
         "✍️ *Signature Verification Bot*\n\n"
-        "📘 *Instructions*\n"
-        "1️⃣ Upload reference signatures (used for ONE verification)\n"
-        "2️⃣ Type /verify\n"
-        "3️⃣ Upload ONE test signature\n\n"
-        "ℹ️ After verification, reference samples are cleared automatically.",
+        "Upload reference signatures (used for ONE verification)\n"
+        "Then type /verify",
         parse_mode="Markdown"
     )
     return REFERENCE
@@ -134,25 +142,13 @@ async def save_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.makedirs(udir, exist_ok=True)
 
     photo = await update.message.photo[-1].get_file()
-    idx = len(os.listdir(udir)) + 1
-    path = os.path.join(udir, f"ref_{idx}.jpg")
+    path = os.path.join(udir, f"ref_{len(os.listdir(udir))+1}.jpg")
     await photo.download_to_drive(path)
 
-    await update.message.reply_text(
-        f"✅ Reference {idx} saved.\n"
-        f"📌 Send more or type `/verify`.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("✅ Reference saved. Type /verify when ready.")
     return REFERENCE
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.message.from_user.id)
-    udir = os.path.join(REF_DIR, uid)
-
-    if not os.path.exists(udir) or len(os.listdir(udir)) < 2:
-        await update.message.reply_text("⚠️ Upload at least 2 reference signatures.")
-        return REFERENCE
-
     await update.message.reply_text("📤 Upload ONE test signature.")
     return WAIT_TEST
 
@@ -165,21 +161,35 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await photo.download_to_drive(test_path)
 
     test_img = preprocess(test_path)
-    scores, best_ref, best = [], None, 0
+
+    scores = []
+    best_ref = None
+    best_ssim = 0
 
     for r in os.listdir(udir):
         ref_img = preprocess(os.path.join(udir, r))
         if ref_img is None:
             continue
-        s = ssim(ref_img, test_img) * 100
-        scores.append(s)
-        if s > best:
-            best = s
+
+        ssim_score = ssim(ref_img, test_img) * 100
+        sd_sim = similarity(stroke_density(ref_img), stroke_density(test_img))
+        cc_sim = similarity(contour_count(ref_img), contour_count(test_img))
+
+        final = (
+            0.6 * ssim_score +
+            0.2 * sd_sim +
+            0.2 * cc_sim
+        )
+
+        scores.append(final)
+
+        if ssim_score > best_ssim:
+            best_ssim = ssim_score
             best_ref = ref_img
 
     score = float(np.mean(scores))
     risk = 100 - score
-    result = "MATCH ✅" if score >= 75 else "MISMATCH ❌"
+    result = "MATCH ✅" if score >= 70 else "MISMATCH ❌"
 
     h = heatmap(best_ref, test_img)
     g = confidence_graph(score)
@@ -211,7 +221,6 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_photo(open(h, "rb"), caption="🔥 Heatmap")
     await update.message.reply_photo(open(g, "rb"), caption="📊 Confidence Graph")
 
-    # 🔥 CLEAR REFERENCES AFTER VERIFICATION (KEY CHANGE)
     shutil.rmtree(udir)
     os.makedirs(udir, exist_ok=True)
 
@@ -224,7 +233,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "pdf":
         await q.message.reply_document(open(context.user_data["pdf"], "rb"))
     elif q.data == "restart":
-        await q.message.reply_text("🔄 Type /start to begin new verification")
+        await q.message.reply_text("🔄 Type /start to begin again")
 
 # ================= MAIN =================
 def main():
@@ -233,10 +242,8 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            REFERENCE: [
-                MessageHandler(filters.PHOTO, save_reference),
-                CommandHandler("verify", verify)
-            ],
+            REFERENCE: [MessageHandler(filters.PHOTO, save_reference),
+                        CommandHandler("verify", verify)],
             WAIT_TEST: [MessageHandler(filters.PHOTO, test_signature)]
         },
         fallbacks=[CommandHandler("start", start)]
@@ -245,10 +252,8 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(callbacks))
 
-    print("🤖 Bot running (one-session reference mode)")
+    print("🤖 Bot running with FAIR scoring")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
-
