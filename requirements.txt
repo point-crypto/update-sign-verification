@@ -3,5 +3,4 @@ opencv-python
 numpy
 scikit-image
 matplotlib
-scikit-learn
 fpdf
