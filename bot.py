@@ -152,6 +152,21 @@ async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📤 Upload ONE test signature.")
     return WAIT_TEST
 
+# ================= DYNAMIC THRESHOLD =================
+def dynamic_threshold(ref_images):
+    if len(ref_images) < 2:
+        return 70.0  # fallback
+
+    sims = []
+    for i in range(len(ref_images)):
+        for j in range(i + 1, len(ref_images)):
+            sims.append(ssim(ref_images[i], ref_images[j]) * 100)
+
+    avg = np.mean(sims)
+    threshold = avg - 7  # safety margin
+
+    return float(min(max(threshold, 65), 85))
+
 async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.message.from_user.id)
     udir = os.path.join(REF_DIR, uid)
@@ -162,15 +177,19 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     test_img = preprocess(test_path)
 
+    ref_imgs = []
+    for r in os.listdir(udir):
+        img = preprocess(os.path.join(udir, r))
+        if img is not None:
+            ref_imgs.append(img)
+
+    threshold = dynamic_threshold(ref_imgs)
+
     scores = []
     best_ref = None
     best_ssim = 0
 
-    for r in os.listdir(udir):
-        ref_img = preprocess(os.path.join(udir, r))
-        if ref_img is None:
-            continue
-
+    for ref_img in ref_imgs:
         ssim_score = ssim(ref_img, test_img) * 100
         sd_sim = similarity(stroke_density(ref_img), stroke_density(test_img))
         cc_sim = similarity(contour_count(ref_img), contour_count(test_img))
@@ -189,13 +208,14 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     score = float(np.mean(scores))
     risk = 100 - score
-    result = "MATCH ✅" if score >= 70 else "MISMATCH ❌"
+    result = "MATCH ✅" if score >= threshold else "MISMATCH ❌"
 
     h = heatmap(best_ref, test_img)
     g = confidence_graph(score)
 
     report = {
         "Score": f"{score:.2f}%",
+        "Dynamic Threshold": f"{threshold:.2f}%",
         "Result": result,
         "Forgery Risk": f"{risk:.2f}%",
         "AI Explanation": ai_text(score)
@@ -211,6 +231,7 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔍 *Result*\n\n"
         f"Score: `{score:.2f}%`\n"
+        f"Threshold: `{threshold:.2f}%`\n"
         f"{result}\n"
         f"Forgery Risk: `{risk:.2f}%`\n\n"
         f"*AI Explanation*\n{ai_text(score)}",
@@ -252,7 +273,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(callbacks))
 
-    print("🤖 Bot running with FAIR scoring")
+    print("🤖 Bot running with Dynamic Threshold")
     app.run_polling()
 
 if __name__ == "__main__":
