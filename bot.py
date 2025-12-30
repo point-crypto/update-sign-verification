@@ -1,6 +1,7 @@
 import os
 import cv2
 import json
+import hashlib
 import numpy as np
 from datetime import datetime
 
@@ -31,15 +32,18 @@ MATCH_THRESHOLD = 75
 
 os.makedirs(REFERENCE_DIR, exist_ok=True)
 
-# ================= SAFE JSON =================
+# ================= UTILITIES =================
+def image_hash(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
 def safe_load_json(path):
     if not os.path.exists(path):
         return []
     try:
         with open(path, "r") as f:
-            data = json.load(f)
-            return data if isinstance(data, list) else []
-    except json.JSONDecodeError:
+            return json.load(f)
+    except:
         return []
 
 def safe_write_json(path, data):
@@ -65,82 +69,91 @@ def extract_features(img):
     edges = cv2.Canny(img, 50, 150)
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    return [
-        int(np.sum(img < 128)),        # ink density
-        int(len(contours)),            # stroke count
-        float(np.mean(edges)),         # edge strength
-        float(img.shape[1] / img.shape[0])  # aspect ratio
-    ]
+    return {
+        "ink": int(np.sum(img < 128)),
+        "strokes": int(len(contours)),
+        "edge": float(np.mean(edges)),
+        "ratio": float(img.shape[1] / img.shape[0])
+    }
 
 def ml_similarity(f1, f2):
-    diff = np.abs(np.array(f1) - np.array(f2))
-    return float((1 / (1 + np.mean(diff))) * 100)
+    diff = np.mean([
+        abs(f1["ink"] - f2["ink"]),
+        abs(f1["strokes"] - f2["strokes"]),
+        abs(f1["edge"] - f2["edge"]),
+        abs(f1["ratio"] - f2["ratio"])
+    ])
+    return float((1 / (1 + diff)) * 100)
 
 # ================= AI EXPLANATION =================
-def ai_reason(score):
+def ai_explain(score, ref_f, test_f):
+    explanation = []
+
+    if abs(ref_f["strokes"] - test_f["strokes"]) > 5:
+        explanation.append("• Stroke count mismatch detected")
+
+    if abs(ref_f["edge"] - test_f["edge"]) > 10:
+        explanation.append("• Writing pressure variation found")
+
     if score >= 90:
-        return (
-            "🧠 AI Analysis:\n"
-            "• Stroke continuity is very stable\n"
-            "• Pressure distribution matches reference\n"
-            "• No visible tremor or retracing\n"
-            "Forgery Type: NONE (Genuine)"
-        )
+        verdict = "Forgery Type: NONE (Genuine)"
     elif score >= 75:
-        return (
-            "🧠 AI Analysis:\n"
-            "• Overall structure matches\n"
-            "• Minor stroke variation detected\n"
-            "• Possible slow tracing signs\n"
-            "Forgery Type: TRACED / SIMULATED"
-        )
+        verdict = "Forgery Type: TRACED / SIMULATED"
     else:
-        return (
-            "🧠 AI Analysis:\n"
-            "• Stroke rhythm inconsistent\n"
-            "• Pressure mismatch detected\n"
-            "• Significant shape deviation\n"
-            "Forgery Type: RANDOM / SKILLED FORGERY"
-        )
+        verdict = "Forgery Type: RANDOM / SKILLED FORGERY"
+
+    if not explanation:
+        explanation.append("• Stroke flow and pressure are consistent")
+
+    return "🧠 AI Explanation:\n" + "\n".join(explanation) + f"\n{verdict}"
 
 # ================= BOT FLOW =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["ref_count"] = 0
+    context.user_data.clear()
+
     await update.message.reply_text(
         "✍️ *AI Signature Verification Bot*\n\n"
-        "📌 Send reference signatures (multiple allowed)\n"
+        "📌 Send reference signatures (duplicates will be ignored)\n"
         "📌 Type /verify when done\n\n"
-        "/history – Past results\n"
+        "/history – Previous results\n"
         "/graph – Accuracy graph",
         parse_mode="Markdown"
     )
+
+    context.user_data["hashes"] = set()
     return REFERENCE
 
+# ================= SAVE REFERENCE =================
 async def save_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     user_dir = os.path.join(REFERENCE_DIR, user_id)
     os.makedirs(user_dir, exist_ok=True)
 
     photo = await update.message.photo[-1].get_file()
-    count = len(os.listdir(user_dir)) + 1
-    path = os.path.join(user_dir, f"ref{count}.jpg")
+    temp_path = "temp_ref.jpg"
+    await photo.download_to_drive(temp_path)
 
-    await photo.download_to_drive(path)
-    context.user_data["ref_count"] += 1
+    h = image_hash(temp_path)
 
-    await update.message.reply_text(
-        f"✅ Reference {count} saved.\nSend more or type /verify"
-    )
-    return REFERENCE
-
-async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("ref_count", 0) == 0:
-        await update.message.reply_text("❌ Upload at least one reference first.")
+    if h in context.user_data["hashes"]:
+        await update.message.reply_text("⚠️ Sample already saved (duplicate ignored)")
         return REFERENCE
 
+    context.user_data["hashes"].add(h)
+
+    count = len(os.listdir(user_dir)) + 1
+    final_path = os.path.join(user_dir, f"ref{count}.jpg")
+    os.replace(temp_path, final_path)
+
+    await update.message.reply_text(f"✅ Reference sample {count} saved")
+    return REFERENCE
+
+# ================= VERIFY =================
+async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📤 Send TEST signature")
     return WAIT_TEST
 
+# ================= TEST IMAGE =================
 async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.message.from_user.id)
     user_dir = os.path.join(REFERENCE_DIR, user_id)
@@ -149,37 +162,31 @@ async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     test_path = "test.jpg"
     await photo.download_to_drive(test_path)
 
+    test_img = preprocess(test_path)
+    test_f = extract_features(test_img)
+
     best_score = 0
+    best_ref_f = None
 
-    for file in os.listdir(user_dir):
-        ref_img = preprocess(os.path.join(user_dir, file))
-        test_img = preprocess(test_path)
-
-        if ref_img is None or test_img is None:
-            continue
+    for f in os.listdir(user_dir):
+        ref_img = preprocess(os.path.join(user_dir, f))
+        ref_f = extract_features(ref_img)
 
         s = ssim(ref_img, test_img) * 100
-        m = ml_similarity(
-            extract_features(ref_img),
-            extract_features(test_img)
-        )
+        m = ml_similarity(ref_f, test_f)
+        final = 0.7 * s + 0.3 * m
 
-        final = (0.7 * s) + (0.3 * m)
-        best_score = max(best_score, final)
+        if final > best_score:
+            best_score = final
+            best_ref_f = ref_f
 
-    score = float(best_score)
-    result = "MATCH ✅" if score >= MATCH_THRESHOLD else "MISMATCH ❌"
-    confidence = "HIGH 🟢" if score >= 85 else "MEDIUM 🟡" if score >= 70 else "LOW 🔴"
-    risk = 100 - score
-
-    explanation = ai_reason(score)
+    result = "MATCH ✅" if best_score >= MATCH_THRESHOLD else "MISMATCH ❌"
+    explanation = ai_explain(best_score, best_ref_f, test_f)
 
     await update.message.reply_text(
-        f"🔍 *Signature Result*\n\n"
-        f"Score: `{score:.2f}%`\n"
-        f"Result: {result}\n"
-        f"Confidence: {confidence}\n"
-        f"Forgery Risk: `{risk:.2f}%`\n\n"
+        f"🔍 *Result*\n\n"
+        f"Score: `{best_score:.2f}%`\n"
+        f"{result}\n\n"
         f"{explanation}",
         parse_mode="Markdown"
     )
@@ -188,9 +195,8 @@ async def test_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logs.append({
         "time": datetime.now().isoformat(),
         "user_id": int(user_id),
-        "score": round(score, 2),
-        "result": result,
-        "confidence": confidence
+        "score": round(best_score, 2),
+        "result": result
     })
     safe_write_json(AUDIT_FILE, logs)
 
@@ -206,7 +212,7 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No history found.")
         return
 
-    msg = "📜 *Last 5 Verifications*\n\n"
+    msg = "📜 *Last 5 Results*\n\n"
     for l in user_logs:
         msg += f"{l['time']} | {l['score']}% | {l['result']}\n"
 
@@ -245,9 +251,7 @@ def main():
                 MessageHandler(filters.PHOTO, save_reference),
                 CommandHandler("verify", verify),
             ],
-            WAIT_TEST: [
-                MessageHandler(filters.PHOTO, test_image),
-            ],
+            WAIT_TEST: [MessageHandler(filters.PHOTO, test_image)],
         },
         fallbacks=[]
     )
@@ -256,7 +260,7 @@ def main():
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("graph", graph))
 
-    print("🤖 Bot running (polling mode)")
+    print("🤖 Bot running (stable polling mode)")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
