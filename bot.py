@@ -21,12 +21,15 @@ REFERENCE, WAIT_TEST = range(2)
 
 BASE_DIR = "data"
 REF_DIR = os.path.join(BASE_DIR, "refs")
+VIS_DIR = "visuals"
 REPORT_DIR = "reports"
+HISTORY_FILE = "history.json"
 
 os.makedirs(REF_DIR, exist_ok=True)
+os.makedirs(VIS_DIR, exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
-# ================= IMAGE =================
+# ================= IMAGE UTILS =================
 def preprocess(path):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
@@ -40,49 +43,91 @@ def preprocess(path):
     return cv2.resize(img, (300, 150))
 
 # ================= VISUALS =================
-def generate_heatmap(ref, test, path="heatmap.png"):
+def accuracy_heatmap(ref, test):
     diff = cv2.absdiff(ref, test)
     heat = cv2.applyColorMap(diff, cv2.COLORMAP_JET)
+    path = f"{VIS_DIR}/accuracy_heatmap.png"
     cv2.imwrite(path, heat)
     return path
 
-def generate_confidence_graph(score, path="confidence.png"):
+def stroke_heatmap(ref, test):
+    edges1 = cv2.Canny(ref, 50, 150)
+    edges2 = cv2.Canny(test, 50, 150)
+    diff = cv2.absdiff(edges1, edges2)
+    heat = cv2.applyColorMap(diff, cv2.COLORMAP_HOT)
+    path = f"{VIS_DIR}/stroke_heatmap.png"
+    cv2.imwrite(path, heat)
+    return path
+
+def confidence_graph(score):
+    path = f"{VIS_DIR}/confidence.png"
     plt.figure()
     plt.bar(["Confidence", "Forgery Risk"], [score, 100-score])
     plt.ylim(0, 100)
-    plt.ylabel("Percentage")
-    plt.title("Verification Confidence")
-    plt.grid(axis="y")
+    plt.savefig(path)
+    plt.close()
+    return path
+
+def accuracy_trend(user_id, score):
+    data = {}
+    if os.path.exists(HISTORY_FILE):
+        data = json.load(open(HISTORY_FILE))
+    data.setdefault(user_id, []).append(score)
+    json.dump(data, open(HISTORY_FILE, "w"), indent=4)
+
+    path = f"{VIS_DIR}/trend.png"
+    plt.figure()
+    plt.plot(data[user_id], marker="o")
+    plt.ylim(0, 100)
+    plt.title("Accuracy Trend")
+    plt.ylabel("Score (%)")
+    plt.grid(True)
     plt.savefig(path)
     plt.close()
     return path
 
 # ================= AI =================
-def classify_forgery(score):
+def ai_text(score):
     if score >= 85:
-        return "Genuine Signature"
+        return (
+            "✔ High structural similarity\n"
+            "✔ Stroke flow consistent\n"
+            "✔ Writing pressure stable\n"
+            "➡ Signature is highly authentic"
+        )
     elif score >= 70:
-        return "Skilled Forgery"
+        return (
+            "⚠ Partial similarity detected\n"
+            "⚠ Minor stroke deviation\n"
+            "➡ Possible skilled forgery"
+        )
     else:
-        return "Random Forgery"
+        return (
+            "❌ Poor structural match\n"
+            "❌ Stroke inconsistency\n"
+            "➡ High probability of forgery"
+        )
 
-def ai_explanation(score):
-    if score >= 85:
-        return "High similarity and stable stroke flow detected."
-    elif score >= 70:
-        return "Moderate similarity with minor stroke deviations."
-    else:
-        return "Low similarity and inconsistent stroke structure."
+def score_color(score):
+    return "🟢" if score >= 85 else "🟡" if score >= 70 else "🔴"
 
 # ================= PDF =================
-def generate_pdf(report):
+def generate_pdf(report, images):
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", size=12)
+
     pdf.cell(0, 10, "Signature Verification Report", ln=True)
     pdf.ln(5)
+
     for k, v in report.items():
         pdf.multi_cell(0, 8, f"{k}: {v}")
+    pdf.ln(3)
+
+    for img in images:
+        pdf.image(img, w=170)
+        pdf.ln(5)
+
     path = f"{REPORT_DIR}/report_{int(datetime.now().timestamp())}.pdf"
     pdf.output(path)
     return path
@@ -90,19 +135,12 @@ def generate_pdf(report):
 # ================= BOT =================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add Reference Signatures", callback_data="add_ref")],
-        [InlineKeyboardButton("▶️ Start Verification", callback_data="start_verify")],
-        [InlineKeyboardButton("ℹ️ Help", callback_data="help")]
-    ])
     await update.message.reply_text(
-        "✍️ *SignaGuard AI – Signature Verification*\n\n"
-        "1️⃣ Upload 2–5 reference signatures\n"
-        "2️⃣ Click *Start Verification*\n"
-        "3️⃣ Upload ONE test signature\n\n"
-        "👇 Choose an option:",
-        parse_mode="Markdown",
-        reply_markup=keyboard
+        "✍️ *Signature Verification Bot*\n\n"
+        "1️⃣ Upload reference signatures\n"
+        "2️⃣ Type /verify\n"
+        "3️⃣ Upload ONE test signature",
+        parse_mode="Markdown"
     )
     return REFERENCE
 
@@ -112,33 +150,16 @@ async def save_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.makedirs(udir, exist_ok=True)
 
     photo = await update.message.photo[-1].get_file()
-    idx = len(os.listdir(udir)) + 1
-    path = os.path.join(udir, f"ref_{idx}.jpg")
+    path = os.path.join(udir, f"ref_{len(os.listdir(udir))+1}.jpg")
     await photo.download_to_drive(path)
-
-    await update.message.reply_text(
-        f"✅ Reference {idx} saved.\nUpload more or press *Start Verification*.",
-        parse_mode="Markdown"
-    )
+    await update.message.reply_text("✅ Reference saved")
     return REFERENCE
 
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.message.from_user.id)
-    udir = os.path.join(REF_DIR, uid)
-
-    if not os.path.exists(udir) or len(os.listdir(udir)) < 2:
-        await update.message.reply_text("⚠️ Upload at least 2 reference signatures.")
-        return REFERENCE
-
-    context.user_data["verified_once"] = False
-    await update.message.reply_text("📤 Upload ONE test signature.")
+    await update.message.reply_text("📤 Upload ONE test signature")
     return WAIT_TEST
 
 async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("verified_once"):
-        await update.message.reply_text("⚠️ Test already completed. Type /start to retry.")
-        return ConversationHandler.END
-
     uid = str(update.message.from_user.id)
     udir = os.path.join(REF_DIR, uid)
 
@@ -147,57 +168,56 @@ async def test_signature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await photo.download_to_drive(test_path)
 
     test_img = preprocess(test_path)
-    if test_img is None:
-        await update.message.reply_text("❌ Unable to process test image.")
-        return ConversationHandler.END
 
-    scores = []
-    best_ref = None
-    best_score = 0
-
+    scores, best_ref, best = [], None, 0
     for r in os.listdir(udir):
         ref_img = preprocess(os.path.join(udir, r))
-        if ref_img is None:
-            continue
         s = ssim(ref_img, test_img) * 100
         scores.append(s)
-        if s > best_score:
-            best_score = s
+        if s > best:
+            best = s
             best_ref = ref_img
 
-    final_score = float(np.mean(scores))
-    forgery = classify_forgery(final_score)
-    explanation = ai_explanation(final_score)
+    score = float(np.mean(scores))
+    risk = 100 - score
+    result = "MATCH ✅" if score >= 75 else "MISMATCH ❌"
 
-    heatmap_path = generate_heatmap(best_ref, test_img)
-    graph_path = generate_confidence_graph(final_score)
+    # Visuals
+    h1 = accuracy_heatmap(best_ref, test_img)
+    h2 = stroke_heatmap(best_ref, test_img)
+    cg = confidence_graph(score)
+    tg = accuracy_trend(uid, score)
 
     report = {
-        "Score (%)": round(final_score, 2),
-        "Forgery Type": forgery,
-        "AI Explanation": explanation,
-        "Verified At": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        "Score": f"{score:.2f}%",
+        "Result": result,
+        "Forgery Risk": f"{risk:.2f}%",
+        "AI Explanation": ai_text(score)
     }
 
-    context.user_data["report"] = report
-    context.user_data["verified_once"] = True
+    context.user_data["pdf"] = generate_pdf(
+        report, [h1, h2, cg]
+    )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📄 Download PDF", callback_data="pdf")],
-        [InlineKeyboardButton("🔁 New Verification", callback_data="restart")]
+        [InlineKeyboardButton("▶️ Start New Verification", callback_data="restart")],
+        [InlineKeyboardButton("📄 Download PDF", callback_data="pdf")]
     ])
 
     await update.message.reply_text(
         f"🔍 *Result*\n\n"
-        f"Score: `{final_score:.2f}%`\n"
-        f"Forgery Type: `{forgery}`\n\n"
-        f"*AI Explanation*\n{explanation}",
+        f"{score_color(score)} Score: `{score:.2f}%`\n"
+        f"{result}\n"
+        f"Forgery Risk: `{risk:.2f}%`\n\n"
+        f"*AI Explanation*\n{ai_text(score)}",
         parse_mode="Markdown",
         reply_markup=keyboard
     )
 
-    await update.message.reply_photo(photo=open(heatmap_path, "rb"), caption="🔥 Stroke Deviation Heatmap")
-    await update.message.reply_photo(photo=open(graph_path, "rb"), caption="📊 Confidence Graph")
+    await update.message.reply_photo(open(h1, "rb"), caption="🔥 Accuracy Heatmap")
+    await update.message.reply_photo(open(h2, "rb"), caption="🔥 Stroke Deviation Heatmap")
+    await update.message.reply_photo(open(cg, "rb"), caption="📊 Confidence Graph")
+    await update.message.reply_photo(open(tg, "rb"), caption="📈 Accuracy Trend")
 
     return ConversationHandler.END
 
@@ -205,24 +225,11 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    if q.data == "start_verify":
-        await q.message.reply_text("Type /verify to continue.")
-
-    elif q.data == "pdf":
-        path = generate_pdf(context.user_data["report"])
-        await q.message.reply_document(open(path, "rb"))
-
-    elif q.data == "restart":
+    if q.data == "restart":
         await q.message.reply_text("🔄 Restarting… Type /start")
 
-    elif q.data == "help":
-        await q.message.reply_text(
-            "ℹ️ *Help*\n\n"
-            "• Use clear signature images\n"
-            "• Same signer for all references\n"
-            "• One test per verification",
-            parse_mode="Markdown"
-        )
+    elif q.data == "pdf":
+        await q.message.reply_document(open(context.user_data["pdf"], "rb"))
 
 # ================= MAIN =================
 def main():
@@ -231,10 +238,8 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            REFERENCE: [
-                MessageHandler(filters.PHOTO, save_reference),
-                CommandHandler("verify", verify)
-            ],
+            REFERENCE: [MessageHandler(filters.PHOTO, save_reference),
+                        CommandHandler("verify", verify)],
             WAIT_TEST: [MessageHandler(filters.PHOTO, test_signature)]
         },
         fallbacks=[]
@@ -243,9 +248,8 @@ def main():
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(callbacks))
 
-    print("🤖 SignaGuard AI running with heatmap & graph")
+    print("🤖 Bot running with ALL features")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
